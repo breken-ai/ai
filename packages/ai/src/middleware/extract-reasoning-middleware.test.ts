@@ -1325,5 +1325,81 @@ describe('extractReasoningMiddleware', () => {
       expect(reasoningEndIndex).toBeGreaterThanOrEqual(0);
       expect(reasoningEndIndex).toBeGreaterThan(reasoningStartIndex);
     });
+
+    it('should end the reasoning part when the text ends before the closing tag', async () => {
+      const mockModel = new MockLanguageModelV4({
+        async doStream() {
+          return {
+            stream: convertArrayToReadableStream([
+              { type: 'text-start', id: '1' },
+              { type: 'text-delta', id: '1', delta: '<think>Let me ' },
+              { type: 'text-delta', id: '1', delta: 'think about' },
+              { type: 'text-end', id: '1' },
+              {
+                type: 'finish',
+                finishReason: { unified: 'length', raw: 'length' },
+                usage: testUsage,
+              },
+            ]),
+          };
+        },
+      });
+
+      const result = streamText({
+        model: wrapLanguageModel({
+          model: mockModel,
+          middleware: extractReasoningMiddleware({ tagName: 'think' }),
+        }),
+        prompt: 'Test prompt',
+      });
+
+      const types = (await convertAsyncIterableToArray(result.fullStream))
+        .map(part => part.type)
+        .filter(
+          type => type.startsWith('reasoning') || type.startsWith('text'),
+        );
+
+      expect(types).toEqual([
+        'reasoning-start',
+        'reasoning-delta',
+        'reasoning-delta',
+        'reasoning-end',
+        'text-start',
+        'text-end',
+      ]);
+      expect(await result.reasoningText).toBe('Let me think about');
+    });
+
+    it('should keep a trailing partial tag as text when the text ends', async () => {
+      const mockModel = new MockLanguageModelV4({
+        async doStream() {
+          return {
+            stream: convertArrayToReadableStream([
+              { type: 'text-start', id: '1' },
+              { type: 'text-delta', id: '1', delta: '<think>ok</think>' },
+              { type: 'text-delta', id: '1', delta: 'if a ' },
+              { type: 'text-delta', id: '1', delta: '<' },
+              { type: 'text-end', id: '1' },
+              {
+                type: 'finish',
+                finishReason: { unified: 'stop', raw: 'stop' },
+                usage: testUsage,
+              },
+            ]),
+          };
+        },
+      });
+
+      const result = streamText({
+        model: wrapLanguageModel({
+          model: mockModel,
+          middleware: extractReasoningMiddleware({ tagName: 'think' }),
+        }),
+        prompt: 'Test prompt',
+      });
+
+      expect(await result.text).toBe('if a <');
+      expect(await result.reasoningText).toBe('ok');
+    });
   });
 });

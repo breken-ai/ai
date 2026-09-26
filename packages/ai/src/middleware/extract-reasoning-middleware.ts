@@ -82,18 +82,18 @@ export function extractReasoningMiddleware({
     wrapStream: async ({ doStream }) => {
       const { stream, ...rest } = await doStream();
 
-      const reasoningExtractions: Record<
-        string,
-        {
-          isFirstReasoning: boolean;
-          isFirstText: boolean;
-          afterSwitch: boolean;
-          isReasoning: boolean;
-          buffer: string;
-          reasoningId: string | undefined;
-          textId: string;
-        }
-      > = createIdMap();
+      type ReasoningExtraction = {
+        isFirstReasoning: boolean;
+        isFirstText: boolean;
+        afterSwitch: boolean;
+        isReasoning: boolean;
+        buffer: string;
+        reasoningId: string | undefined;
+        textId: string;
+      };
+
+      const reasoningExtractions: Record<string, ReasoningExtraction> =
+        createIdMap();
 
       let reasoningIdCounter = 0;
 
@@ -101,6 +101,61 @@ export function extractReasoningMiddleware({
         string,
         Extract<LanguageModelV4StreamPart, { type: 'text-start' }>
       > = createIdMap();
+
+      function getReasoningId(activeExtraction: ReasoningExtraction) {
+        return (activeExtraction.reasoningId ??= `reasoning-${reasoningIdCounter++}`);
+      }
+
+      function publish(
+        activeExtraction: ReasoningExtraction,
+        text: string,
+        controller: TransformStreamDefaultController<LanguageModelV4StreamPart>,
+      ) {
+        if (text.length > 0) {
+          const prefix =
+            activeExtraction.afterSwitch &&
+            (activeExtraction.isReasoning
+              ? !activeExtraction.isFirstReasoning
+              : !activeExtraction.isFirstText)
+              ? separator
+              : '';
+
+          if (
+            activeExtraction.isReasoning &&
+            (activeExtraction.afterSwitch || activeExtraction.isFirstReasoning)
+          ) {
+            controller.enqueue({
+              type: 'reasoning-start',
+              id: getReasoningId(activeExtraction),
+            });
+          }
+
+          if (activeExtraction.isReasoning) {
+            controller.enqueue({
+              type: 'reasoning-delta',
+              delta: prefix + text,
+              id: getReasoningId(activeExtraction),
+            });
+          } else {
+            if (delayedTextStarts[activeExtraction.textId] != null) {
+              controller.enqueue(delayedTextStarts[activeExtraction.textId]);
+              delete delayedTextStarts[activeExtraction.textId];
+            }
+            controller.enqueue({
+              type: 'text-delta',
+              delta: prefix + text,
+              id: activeExtraction.textId,
+            });
+          }
+          activeExtraction.afterSwitch = false;
+
+          if (activeExtraction.isReasoning) {
+            activeExtraction.isFirstReasoning = false;
+          } else {
+            activeExtraction.isFirstText = false;
+          }
+        }
+      }
 
       return {
         stream: stream.pipeThrough(
@@ -114,6 +169,31 @@ export function extractReasoningMiddleware({
               if (chunk.type === 'text-start') {
                 delayedTextStarts[chunk.id] = chunk;
                 return;
+              }
+
+              // when a text part ends, flush what is still held back:
+              // a trailing partial tag is plain content, and a reasoning
+              // block without a closing tag (e.g. truncated output) must end.
+              if (
+                chunk.type === 'text-end' &&
+                reasoningExtractions[chunk.id] != null
+              ) {
+                const activeExtraction = reasoningExtractions[chunk.id];
+                delete reasoningExtractions[chunk.id];
+
+                publish(activeExtraction, activeExtraction.buffer, controller);
+                activeExtraction.buffer = '';
+
+                if (
+                  activeExtraction.isReasoning &&
+                  activeExtraction.reasoningId != null
+                ) {
+                  controller.enqueue({
+                    type: 'reasoning-end',
+                    id: activeExtraction.reasoningId,
+                  });
+                  activeExtraction.reasoningId = undefined;
+                }
               }
 
               if (
@@ -145,60 +225,6 @@ export function extractReasoningMiddleware({
 
               activeExtraction.buffer += chunk.delta;
 
-              function getReasoningId() {
-                return (activeExtraction.reasoningId ??= `reasoning-${reasoningIdCounter++}`);
-              }
-
-              function publish(text: string) {
-                if (text.length > 0) {
-                  const prefix =
-                    activeExtraction.afterSwitch &&
-                    (activeExtraction.isReasoning
-                      ? !activeExtraction.isFirstReasoning
-                      : !activeExtraction.isFirstText)
-                      ? separator
-                      : '';
-
-                  if (
-                    activeExtraction.isReasoning &&
-                    (activeExtraction.afterSwitch ||
-                      activeExtraction.isFirstReasoning)
-                  ) {
-                    controller.enqueue({
-                      type: 'reasoning-start',
-                      id: getReasoningId(),
-                    });
-                  }
-
-                  if (activeExtraction.isReasoning) {
-                    controller.enqueue({
-                      type: 'reasoning-delta',
-                      delta: prefix + text,
-                      id: getReasoningId(),
-                    });
-                  } else {
-                    if (delayedTextStarts[activeExtraction.textId] != null) {
-                      controller.enqueue(
-                        delayedTextStarts[activeExtraction.textId],
-                      );
-                      delete delayedTextStarts[activeExtraction.textId];
-                    }
-                    controller.enqueue({
-                      type: 'text-delta',
-                      delta: prefix + text,
-                      id: activeExtraction.textId,
-                    });
-                  }
-                  activeExtraction.afterSwitch = false;
-
-                  if (activeExtraction.isReasoning) {
-                    activeExtraction.isFirstReasoning = false;
-                  } else {
-                    activeExtraction.isFirstText = false;
-                  }
-                }
-              }
-
               do {
                 const nextTag = activeExtraction.isReasoning
                   ? closingTag
@@ -211,13 +237,21 @@ export function extractReasoningMiddleware({
 
                 // no opening or closing tag found, publish the buffer
                 if (startIndex == null) {
-                  publish(activeExtraction.buffer);
+                  publish(
+                    activeExtraction,
+                    activeExtraction.buffer,
+                    controller,
+                  );
                   activeExtraction.buffer = '';
                   break;
                 }
 
                 // publish text before the tag
-                publish(activeExtraction.buffer.slice(0, startIndex));
+                publish(
+                  activeExtraction,
+                  activeExtraction.buffer.slice(0, startIndex),
+                  controller,
+                );
 
                 const foundFullMatch =
                   startIndex + nextTag.length <= activeExtraction.buffer.length;
@@ -235,14 +269,14 @@ export function extractReasoningMiddleware({
                     if (activeExtraction.isFirstReasoning) {
                       controller.enqueue({
                         type: 'reasoning-start',
-                        id: getReasoningId(),
+                        id: getReasoningId(activeExtraction),
                       });
                     }
 
                     // reasoning part finished:
                     controller.enqueue({
                       type: 'reasoning-end',
-                      id: getReasoningId(),
+                      id: getReasoningId(activeExtraction),
                     });
                     activeExtraction.reasoningId = undefined;
                   }
