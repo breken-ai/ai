@@ -1168,6 +1168,8 @@ describe('HttpMCPTransport', () => {
       authProvider,
       fetch: fetchFn,
     });
+    const onerror = vi.fn();
+    transport.onerror = onerror;
 
     await transport.start();
 
@@ -1180,8 +1182,88 @@ describe('HttpMCPTransport', () => {
       }),
     ).rejects.toBeInstanceOf(UnauthorizedError);
 
+    expect(onerror).toHaveBeenCalledTimes(1);
+
     expect(authorizationUrl?.searchParams.get('scope')).toBe('mcp.challenge');
     await transport.close();
+  });
+
+  it('should report a failed POST to onerror once', async () => {
+    const fetchFn = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) =>
+        init?.method === 'POST'
+          ? new Response('Bad Gateway', { status: 502 })
+          : new Response(null, { status: 405 }),
+    );
+
+    transport = new HttpMCPTransport({
+      url: 'http://localhost:4000/mcp',
+      fetch: fetchFn,
+    });
+    const onerror = vi.fn();
+    transport.onerror = onerror;
+
+    await transport.start();
+
+    await expect(
+      transport.send({
+        jsonrpc: '2.0',
+        method: 'tools/list',
+        id: 1,
+        params: {},
+      }),
+    ).rejects.toThrow('POSTing to endpoint (HTTP 502)');
+
+    expect(onerror).toHaveBeenCalledTimes(1);
+    expect((onerror.mock.calls[0][0] as MCPClientError).statusCode).toBe(502);
+  });
+
+  it('should call onUncaughtError once when a request fails', async () => {
+    const fetchFn = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method !== 'POST') {
+          return new Response(null, { status: 405 });
+        }
+
+        const message = JSON.parse(String(init.body));
+
+        if (message.method === 'initialize') {
+          return Response.json({
+            jsonrpc: '2.0',
+            id: message.id,
+            result: {
+              protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
+              capabilities: { tools: {} },
+              serverInfo: { name: 'test-server', version: '1.0.0' },
+            },
+          });
+        }
+
+        if (!('id' in message)) {
+          return new Response(null, { status: 202 });
+        }
+
+        return new Response('Bad Gateway', { status: 502 });
+      },
+    );
+    const onUncaughtError = vi.fn();
+
+    const client = await createMCPClient({
+      protocolVersionDiscovery: false,
+      transport: {
+        type: 'http',
+        url: 'http://localhost:4000/mcp',
+        fetch: fetchFn,
+      },
+      onUncaughtError,
+    });
+
+    await expect(client.tools()).rejects.toThrow(
+      'POSTing to endpoint (HTTP 502)',
+    );
+    expect(onUncaughtError).toHaveBeenCalledTimes(1);
+
+    await client.close();
   });
 
   describe('redirect option', () => {

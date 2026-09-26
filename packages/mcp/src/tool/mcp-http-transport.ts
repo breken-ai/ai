@@ -272,177 +272,155 @@ export class HttpMCPTransport implements MCPTransport {
           : AbortSignal.any([transportSignal, options.signal]);
 
     const attempt = async (triedAuth: boolean = false): Promise<void> => {
-      try {
-        const isInitializeRequest =
-          'method' in message && message.method === 'initialize';
-        const sessionIdForRequest = isInitializeRequest
-          ? undefined
-          : this.sessionId;
-        const headers = await this.commonHeaders({
-          base: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json, text/event-stream',
-            ...(this.isModernProtocol() ? options?.headers : {}),
-            ...(this.isModernProtocol() &&
-            'method' in message &&
-            'id' in message
-              ? this.getStandardRequestHeaders(message)
-              : {}),
-          },
-          includeSessionId: !isInitializeRequest,
+      const isInitializeRequest =
+        'method' in message && message.method === 'initialize';
+      const sessionIdForRequest = isInitializeRequest
+        ? undefined
+        : this.sessionId;
+      const headers = await this.commonHeaders({
+        base: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          ...(this.isModernProtocol() ? options?.headers : {}),
+          ...(this.isModernProtocol() && 'method' in message && 'id' in message
+            ? this.getStandardRequestHeaders(message)
+            : {}),
+        },
+        includeSessionId: !isInitializeRequest,
+      });
+
+      const init = {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(message),
+        signal: requestSignal,
+        redirect: this.redirectMode,
+      } satisfies RequestInit;
+
+      const response = await this.fetchFn(this.url.href, init);
+
+      this.applySessionIdFromResponse(response);
+
+      if (response.status === 401 && this.authProvider && !triedAuth) {
+        const { resourceMetadataUrl, scope } =
+          extractWWWAuthenticateParams(response);
+        this.resourceMetadataUrl = resourceMetadataUrl;
+        const result = await this.authorizeOnce(
+          this.resourceMetadataUrl,
+          scope,
+        );
+        if (result !== 'AUTHORIZED') {
+          throw new UnauthorizedError();
+        }
+        return attempt(true);
+      }
+
+      // If server accepted the message (e.g. initialized notification), optionally (re)start inbound SSE
+      if (response.status === 202) {
+        // If inbound SSE was not available earlier (e.g. 405 before init), try again now
+        // Do not await to avoid blocking send()
+        if (!this.isModernProtocol() && !this.inboundSseConnection) {
+          this.startInboundSse();
+        }
+        return;
+      }
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => null);
+
+        if ('id' in message && text != null) {
+          const jsonRpcMessage = await parseJSONRPCMessage(text).catch(
+            () => undefined,
+          );
+          if (jsonRpcMessage != null && 'error' in jsonRpcMessage) {
+            this.onmessage?.(
+              jsonRpcMessage.id == null
+                ? { ...jsonRpcMessage, id: message.id }
+                : jsonRpcMessage,
+            );
+            return;
+          }
+        }
+
+        let errorMessage = `MCP HTTP Transport Error: POSTing to endpoint (HTTP ${response.status}): ${text}`;
+
+        if (response.status === 404) {
+          if (!this.isModernProtocol() && sessionIdForRequest) {
+            this.expireSessionId(sessionIdForRequest);
+
+            errorMessage +=
+              '. The MCP session expired. Create a new client without `initialSessionId` to start a fresh session';
+          } else if (!this.isModernProtocol()) {
+            errorMessage +=
+              '. This server does not support HTTP transport. Try using `sse` transport instead';
+          }
+        }
+
+        const error = new MCPClientError({
+          message: errorMessage,
+          statusCode: response.status,
+          url: this.url.href,
+          responseBody: text ?? undefined,
         });
+        throw error;
+      }
 
-        const init = {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(message),
-          signal: requestSignal,
-          redirect: this.redirectMode,
-        } satisfies RequestInit;
+      // Notifications (messages without 'id') don't expect a JSON-RPC response
+      // Some servers return 200 with acknowledgment JSON instead of 202
+      const isNotification = !('id' in message);
+      if (isNotification) {
+        return;
+      }
 
-        const response = await this.fetchFn(this.url.href, init);
-
-        this.applySessionIdFromResponse(response);
-
-        if (response.status === 401 && this.authProvider && !triedAuth) {
-          const { resourceMetadataUrl, scope } =
-            extractWWWAuthenticateParams(response);
-          this.resourceMetadataUrl = resourceMetadataUrl;
-          try {
-            const result = await this.authorizeOnce(
-              this.resourceMetadataUrl,
-              scope,
-            );
-            if (result !== 'AUTHORIZED') {
-              const error = new UnauthorizedError();
-              throw error;
-            }
-          } catch (error) {
-            this.onerror?.(error);
-            throw error;
-          }
-          return attempt(true);
+      const contentType = response.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const data = await response.json();
+        const messages: JSONRPCMessage[] = Array.isArray(data)
+          ? data.map((message: unknown) => validateJSONRPCMessage(message))
+          : [validateJSONRPCMessage(data)];
+        for (const jsonRpcMessage of messages) {
+          this.onmessage?.(jsonRpcMessage);
         }
+        return;
+      }
 
-        // If server accepted the message (e.g. initialized notification), optionally (re)start inbound SSE
-        if (response.status === 202) {
-          // If inbound SSE was not available earlier (e.g. 405 before init), try again now
-          // Do not await to avoid blocking send()
-          if (!this.isModernProtocol() && !this.inboundSseConnection) {
-            this.startInboundSse();
-          }
-          return;
-        }
-
-        if (!response.ok) {
-          const text = await response.text().catch(() => null);
-
-          if ('id' in message && text != null) {
-            const jsonRpcMessage = await parseJSONRPCMessage(text).catch(
-              () => undefined,
-            );
-            if (jsonRpcMessage != null && 'error' in jsonRpcMessage) {
-              this.onmessage?.(
-                jsonRpcMessage.id == null
-                  ? { ...jsonRpcMessage, id: message.id }
-                  : jsonRpcMessage,
-              );
-              return;
-            }
-          }
-
-          let errorMessage = `MCP HTTP Transport Error: POSTing to endpoint (HTTP ${response.status}): ${text}`;
-
-          if (response.status === 404) {
-            if (!this.isModernProtocol() && sessionIdForRequest) {
-              this.expireSessionId(sessionIdForRequest);
-
-              errorMessage +=
-                '. The MCP session expired. Create a new client without `initialSessionId` to start a fresh session';
-            } else if (!this.isModernProtocol()) {
-              errorMessage +=
-                '. This server does not support HTTP transport. Try using `sse` transport instead';
-            }
-          }
-
+      if (contentType.includes('text/event-stream')) {
+        if (!response.body) {
           const error = new MCPClientError({
-            message: errorMessage,
+            message:
+              'MCP HTTP Transport Error: text/event-stream response without body',
             statusCode: response.status,
             url: this.url.href,
-            responseBody: text ?? undefined,
           });
-          this.onerror?.(error);
           throw error;
         }
 
-        // Notifications (messages without 'id') don't expect a JSON-RPC response
-        // Some servers return 200 with acknowledgment JSON instead of 202
-        const isNotification = !('id' in message);
-        if (isNotification) {
-          return;
-        }
+        const stream = response.body
+          .pipeThrough(new TextDecoderStream())
+          .pipeThrough(new EventSourceParserStream());
+        const reader = stream.getReader();
 
-        const contentType = response.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          const data = await response.json();
-          const messages: JSONRPCMessage[] = Array.isArray(data)
-            ? data.map((message: unknown) => validateJSONRPCMessage(message))
-            : [validateJSONRPCMessage(data)];
-          for (const jsonRpcMessage of messages) {
-            this.onmessage?.(jsonRpcMessage);
-          }
-          return;
-        }
-
-        if (contentType.includes('text/event-stream')) {
-          if (!response.body) {
-            const error = new MCPClientError({
-              message:
-                'MCP HTTP Transport Error: text/event-stream response without body',
-              statusCode: response.status,
-              url: this.url.href,
-            });
-            this.onerror?.(error);
-            throw error;
-          }
-
-          const stream = response.body
-            .pipeThrough(new TextDecoderStream())
-            .pipeThrough(new EventSourceParserStream());
-          const reader = stream.getReader();
-
-          const processEvents = async () => {
-            try {
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) return;
-                const { event, data } = value;
-                if (isMessageEvent(event)) {
-                  try {
-                    const jsonRpcMessage = await parseJSONRPCMessage(data);
-                    this.onmessage?.(jsonRpcMessage);
-                  } catch (error) {
-                    const e = new MCPClientError({
-                      message:
-                        'MCP HTTP Transport Error: Failed to parse message',
-                      cause: error,
-                    });
-                    this.onerror?.(e);
-                  }
+        const processEvents = async () => {
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) return;
+              const { event, data } = value;
+              if (isMessageEvent(event)) {
+                try {
+                  const jsonRpcMessage = await parseJSONRPCMessage(data);
+                  this.onmessage?.(jsonRpcMessage);
+                } catch (error) {
+                  const e = new MCPClientError({
+                    message:
+                      'MCP HTTP Transport Error: Failed to parse message',
+                    cause: error,
+                  });
+                  this.onerror?.(e);
                 }
               }
-            } catch (error) {
-              if (
-                options?.signal?.aborted ||
-                (error instanceof Error && error.name === 'AbortError')
-              ) {
-                return;
-              }
-              this.onerror?.(error);
             }
-          };
-
-          void processEvents().catch(error => {
+          } catch (error) {
             if (
               options?.signal?.aborted ||
               (error instanceof Error && error.name === 'AbortError')
@@ -450,27 +428,37 @@ export class HttpMCPTransport implements MCPTransport {
               return;
             }
             this.onerror?.(error);
-          });
-          return;
-        }
+          }
+        };
 
-        const error = new MCPClientError({
-          message: `MCP HTTP Transport Error: Unexpected content type: ${contentType}`,
-          statusCode: response.status,
-          url: this.url.href,
+        void processEvents().catch(error => {
+          if (
+            options?.signal?.aborted ||
+            (error instanceof Error && error.name === 'AbortError')
+          ) {
+            return;
+          }
+          this.onerror?.(error);
         });
-        this.onerror?.(error);
-        throw error;
-      } catch (error) {
-        if (options?.signal?.aborted) {
-          throw error;
-        }
-        this.onerror?.(error);
-        throw error;
+        return;
       }
+
+      const error = new MCPClientError({
+        message: `MCP HTTP Transport Error: Unexpected content type: ${contentType}`,
+        statusCode: response.status,
+        url: this.url.href,
+      });
+      throw error;
     };
 
-    await attempt();
+    try {
+      await attempt();
+    } catch (error) {
+      if (!options?.signal?.aborted) {
+        this.onerror?.(error);
+      }
+      throw error;
+    }
   }
 
   private getStandardRequestHeaders(
